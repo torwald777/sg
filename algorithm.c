@@ -8,6 +8,7 @@
  */
 
 #include "algorithm.h"
+#include "findnonce.h"
 #include "sph/sph_sha2.h"
 #include "ocl.h"
 #include "ocl/build_kernel.h"
@@ -41,6 +42,7 @@
 #include "algorithm/blakecoin.h"
 #include "algorithm/ethash.h"
 #include "algorithm/cryptonight.h"
+#include "algorithm/equihash.h"
 
 #include "compat.h"
 
@@ -74,7 +76,8 @@ const char *algorithm_type_str[] = {
   "Blake",
   "Vanilla",
   "Ethash",
-  "cryptonight"
+  "Cryptonight",
+  "Equihash"
 };
 
 void sha256(const unsigned char *message, unsigned int len, unsigned char *digest)
@@ -118,7 +121,9 @@ static void append_scrypt_compiler_options(struct _build_kernel_data *data, stru
   strcat(data->binary_filename, buf);
 }
 
-extern uint32_t EthereumEpochNumber;
+static void append_ethash_compiler_options(struct _build_kernel_data *data, struct cgpu_info *cgpu, struct _algorithm_t *algorithm)
+{
+}
 
 static void append_neoscrypt_compiler_options(struct _build_kernel_data *data, struct cgpu_info *cgpu, struct _algorithm_t *algorithm)
 {
@@ -928,141 +933,157 @@ static cl_int queue_pluck_kernel(_clState *clState, dev_blk_ctx *blk, __maybe_un
 
 static cl_int queue_blake_kernel(_clState *clState, dev_blk_ctx *blk, __maybe_unused cl_uint threads)
 {
-	cl_kernel *kernel = &clState->kernel;
-	unsigned int num = 0;
-	cl_int status = 0;
-	cl_ulong le_target;
+  cl_kernel *kernel = &clState->kernel;
+  unsigned int num = 0;
+  cl_int status = 0;
+  cl_ulong le_target;
 
-	le_target = *(cl_ulong *)(blk->work->device_target + 24);
-	flip80(clState->cldata, blk->work->data);
-	status = clEnqueueWriteBuffer(clState->commandQueue, clState->CLbuffer0, true, 0, 80, clState->cldata, 0, NULL, NULL);
+  le_target = *(cl_ulong *)(blk->work->device_target + 24);
+  flip80(clState->cldata, blk->work->data);
+  status = clEnqueueWriteBuffer(clState->commandQueue, clState->CLbuffer0, true, 0, 80, clState->cldata, 0, NULL, NULL);
 
-	CL_SET_ARG(clState->outputBuffer);
-	CL_SET_ARG(blk->work->blk.ctx_a);
-	CL_SET_ARG(blk->work->blk.ctx_b);
-	CL_SET_ARG(blk->work->blk.ctx_c);
-	CL_SET_ARG(blk->work->blk.ctx_d);
-	CL_SET_ARG(blk->work->blk.ctx_e);
-	CL_SET_ARG(blk->work->blk.ctx_f);
-	CL_SET_ARG(blk->work->blk.ctx_g);
-	CL_SET_ARG(blk->work->blk.ctx_h);
+  CL_SET_ARG(clState->outputBuffer);
+  CL_SET_ARG(blk->work->blk.ctx_a);
+  CL_SET_ARG(blk->work->blk.ctx_b);
+  CL_SET_ARG(blk->work->blk.ctx_c);
+  CL_SET_ARG(blk->work->blk.ctx_d);
+  CL_SET_ARG(blk->work->blk.ctx_e);
+  CL_SET_ARG(blk->work->blk.ctx_f);
+  CL_SET_ARG(blk->work->blk.ctx_g);
+  CL_SET_ARG(blk->work->blk.ctx_h);
 
-	CL_SET_ARG(blk->work->blk.cty_a);
-	CL_SET_ARG(blk->work->blk.cty_b);
-	CL_SET_ARG(blk->work->blk.cty_c);
+  CL_SET_ARG(blk->work->blk.cty_a);
+  CL_SET_ARG(blk->work->blk.cty_b);
+  CL_SET_ARG(blk->work->blk.cty_c);
 
-	return status;
+  return status;
 }
 
-extern cglock_t EthCacheLock[2];
-extern uint8_t* EthCache[2];
 extern pthread_mutex_t eth_nonce_lock;
 extern uint32_t eth_nonce;
+static const int eth_future_epochs = 6;
 static cl_int queue_ethash_kernel(_clState *clState, dev_blk_ctx *blk, __maybe_unused cl_uint threads)
 {
-	cl_kernel *kernel;
-	unsigned int num = 0;
-	cl_int status = 0;
-	cl_ulong le_target;
-	cl_uint HighNonce, Isolate = 0xFFFFFFFFUL;
-	cl_ulong DAGSize = EthGetDAGSize(blk->work->EpochNumber);
-	size_t DAGItems = (size_t) (DAGSize / 64);
-	
-	le_target = *(cl_ulong *)(blk->work->device_target + 24);
-	
-	// DO NOT flip80.
-	status = clEnqueueWriteBuffer(clState->commandQueue, clState->CLbuffer0, true, 0, 32, blk->work->data, 0, NULL, NULL);
-	if (clState->EpochNumber != blk->work->EpochNumber)
-	{
-		clState->EpochNumber = blk->work->EpochNumber;
-		cl_ulong CacheSize = EthGetCacheSize(blk->work->EpochNumber);
-		cl_event DAGGenEvent;
-		
-		applog(LOG_DEBUG, "DAG being regenerated.");
-		if (clState->EthCache)
-			clReleaseMemObject(clState->EthCache);
-		if (clState->DAG)
-			clReleaseMemObject(clState->DAG);
+  struct pool *pool = blk->work->pool;
+  eth_dag_t *dag;
+  cl_kernel *kernel;
+  unsigned int num = 0;
+  cl_int status = 0;
+  cl_ulong le_target;
+  cl_uint HighNonce, Isolate = UINT32_MAX;
 
-		clState->DAG = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, DAGSize, NULL, &status);	
-		if (status != CL_SUCCESS)
-		{
-			applog(LOG_ERR, "Error %d: Creating the DAG buffer.", status);
-			return(status);
-		}
-	
-		clState->EthCache = clCreateBuffer(clState->context, CL_MEM_READ_ONLY, CacheSize, NULL, &status);
-	
-		int idx = blk->work->EpochNumber % 2;
-		cg_ilock(&EthCacheLock[idx]);
-		bool update = (EthCache[idx] == NULL || *(uint32_t*) EthCache[idx] != blk->work->EpochNumber);
-		if (update)
-		{
-			cg_ulock(&EthCacheLock[idx]);	
-			EthCache[idx] = realloc(EthCache[idx], sizeof(uint8_t) * CacheSize + 64);
-			*(uint32_t*) EthCache[idx] = blk->work->EpochNumber;
-			EthGenerateCache(EthCache[idx] + 64, blk->work->seedhash, CacheSize);
-		}
-		else
-			cg_dlock(&EthCacheLock[idx]);
+  cg_ilock(&pool->data_lock);
+  if (pool->eth_cache.disabled || pool->eth_cache.dag_cache == NULL) {
+    cg_iunlock(&pool->data_lock);
+    cgsleep_ms(200);
+    applog(LOG_DEBUG, "THR[%d]: stop ETHASH mining", blk->work->thr_id);
+    return 1;
+  }
+  dag = &blk->work->thr->cgpu->eth_dag;
+  cg_ilock(&dag->lock);
+  if (dag->current_epoch != blk->work->eth_epoch) {
+    cl_ulong CacheSize = EthGetCacheSize(blk->work->eth_epoch);
+    cg_ulock(&dag->lock);
+    if (dag->dag_buffer == NULL || blk->work->eth_epoch > dag->max_epoch) {
+      if (dag->dag_buffer != NULL) {
+	cg_dlock(&pool->data_lock);
+        clReleaseMemObject(dag->dag_buffer);
+      }
+      else {
+	cg_ulock(&pool->data_lock);
+	int size = ++pool->eth_cache.nDevs;
+	pool->eth_cache.dags = (eth_dag_t **) realloc(pool->eth_cache.dags, sizeof(void*) * size);
+	pool->eth_cache.dags[size-1] = dag;
+	dag->pool = pool;
+	cg_dwlock(&pool->data_lock);
+      }
+      dag->max_epoch = blk->work->eth_epoch + eth_future_epochs;
+      dag->dag_buffer = clCreateBuffer(clState->context, CL_MEM_READ_WRITE, EthGetDAGSize(dag->max_epoch), NULL, &status);
+      if (status != CL_SUCCESS) {
+	cg_runlock(&pool->data_lock);
+	dag->max_epoch = 0;
+	dag->dag_buffer = NULL;
+	cg_wunlock(&dag->lock);
+	applog(LOG_ERR, "Error %d: Creating the DAG buffer failed.", status);
+	return status;
+      }
+    }
+    else
+      cg_dlock(&pool->data_lock);
 
-		if (status == CL_SUCCESS)
-			status = clEnqueueWriteBuffer(clState->commandQueue, clState->EthCache, true, 0, sizeof(cl_uchar) * CacheSize, EthCache[idx] + 64, 0, NULL, NULL);
+    applog(LOG_DEBUG, "DAG being regenerated.");
+    cl_mem eth_cache = clCreateBuffer(clState->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, CacheSize, pool->eth_cache.dag_cache, &status);
+    cg_runlock(&pool->data_lock);
+    if (status != CL_SUCCESS) {
+      clReleaseMemObject(eth_cache);
+      cg_wunlock(&dag->lock);
+      applog(LOG_ERR, "Error %d: Creating the ethash cache buffer failed.", status);
+      return status;
+    }
 
-		if (update)
-			cg_wunlock(&EthCacheLock[idx]);
-		else
-			cg_runlock(&EthCacheLock[idx]);
-		
-		if (status != CL_SUCCESS)
-		{
-			applog(LOG_ERR, "Error %d: Creating the cache buffer and/or writing to it.", status);
-			return(status);
-		}
-		
-		// enqueue DAG gen kernel
-		kernel = &clState->GenerateDAG;
-		
-		cl_uint zero = 0;
-		cl_uint CacheSize64 = CacheSize / 64;
-		
-		CL_SET_ARG(zero);
-		CL_SET_ARG(clState->EthCache);
-		CL_SET_ARG(clState->DAG);
-		CL_SET_ARG(CacheSize64);
-		CL_SET_ARG(Isolate);
-		
-		status |= clEnqueueNDRangeKernel(clState->commandQueue, clState->GenerateDAG, 1, NULL, &DAGItems, NULL, 0, NULL, &DAGGenEvent);
-		status |= clWaitForEvents(1, &DAGGenEvent);
-		clReleaseEvent(DAGGenEvent);
-		
-		if(status != CL_SUCCESS)
-		{
-			applog(LOG_ERR, "Error %d: Setting args for the DAG kernel and/or executing it.", status);
-			return(status);
-		}
-	}
-	
-	mutex_lock(&eth_nonce_lock);
-	HighNonce = eth_nonce++;
-	blk->work->Nonce = (cl_ulong) HighNonce << 32;
-	mutex_unlock(&eth_nonce_lock);
-		
-	num = 0;
-	kernel = &clState->kernel;
-	
-	// Not nodes now (64 bytes), but DAG entries (128 bytes)
-	cl_uint ItemsArg = DAGItems >> 1;
-	
-	CL_SET_ARG(clState->outputBuffer);
-	CL_SET_ARG(clState->CLbuffer0);
-	CL_SET_ARG(clState->DAG);
-	CL_SET_ARG(ItemsArg);
-	CL_SET_ARG(blk->work->Nonce);
-	CL_SET_ARG(le_target);
-	CL_SET_ARG(Isolate);
-	
-	return(status);
+    // enqueue DAG gen kernel
+    kernel = &clState->GenerateDAG;
+
+    cl_uint zero = 0;
+    cl_uint CacheSize64 = CacheSize / 64;
+
+    CL_SET_ARG(zero);
+    CL_SET_ARG(eth_cache);
+    CL_SET_ARG(dag->dag_buffer);
+    CL_SET_ARG(CacheSize64);
+    CL_SET_ARG(Isolate);
+
+    cl_ulong DAGSize = EthGetDAGSize(blk->work->eth_epoch);
+    size_t DAGItems = (size_t) (DAGSize / 64);
+    status |= clEnqueueNDRangeKernel(clState->commandQueue, clState->GenerateDAG, 1, NULL, &DAGItems, NULL, 0, NULL, NULL);
+    clFinish(clState->commandQueue);
+
+    clReleaseMemObject(eth_cache);
+    if (status != CL_SUCCESS) {
+      cg_wunlock(&dag->lock);
+      applog(LOG_ERR, "Error %d: Setting args for the DAG kernel and/or executing it.", status);
+      return status;
+    }
+    dag->current_epoch = blk->work->eth_epoch;
+    cg_dwlock(&dag->lock);
+  }
+  else {
+    cg_dlock(&dag->lock);
+    cg_iunlock(&pool->data_lock);
+  }
+
+  memcpy(&le_target, blk->work->device_target + 24, 8);
+  mutex_lock(&eth_nonce_lock);
+  HighNonce = eth_nonce++;
+  blk->work->Nonce = (cl_ulong) HighNonce << 32;
+  mutex_unlock(&eth_nonce_lock);
+
+  num = 0;
+  kernel = &clState->kernel;
+
+  // Not nodes now (64 bytes), but DAG entries (128 bytes)
+  cl_ulong DAGSize = EthGetDAGSize(blk->work->eth_epoch);
+  cl_uint ItemsArg = DAGSize / 128;
+
+  // DO NOT flip80.
+  status |= clEnqueueWriteBuffer(clState->commandQueue, clState->CLbuffer0, true, 0, 32, blk->work->data, 0, NULL, NULL);
+  
+  CL_SET_ARG(clState->outputBuffer);
+  CL_SET_ARG(clState->CLbuffer0);
+  CL_SET_ARG(dag->dag_buffer);
+  CL_SET_ARG(ItemsArg);
+  CL_SET_ARG(blk->work->Nonce);
+  CL_SET_ARG(le_target);
+  CL_SET_ARG(Isolate);
+
+  if (status != CL_SUCCESS)
+    cg_runlock(&dag->lock);
+  return status;
+}
+
+static void append_equihash_compiler_options(struct _build_kernel_data *data, struct cgpu_info *cgpu, struct _algorithm_t *algorithm)
+{  
+  strcat(data->compiler_options, "");
 }
 
 static cl_int queue_cryptonight_kernel(_clState *clState, dev_blk_ctx *blk, __maybe_unused cl_uint threads)
@@ -1125,6 +1146,57 @@ static cl_int queue_cryptonight_kernel(_clState *clState, dev_blk_ctx *blk, __ma
 	return(status);
 }
 
+
+
+static cl_int queue_equihash_kernel(_clState *clState, dev_blk_ctx *blk, __maybe_unused cl_uint threads)
+{
+  cl_int status = 0;
+  size_t work_items = threads;
+  size_t worksize = clState->wsize;
+
+  uint64_t mid_hash[8];
+  equihash_calc_mid_hash(mid_hash, blk->work->equihash_data);
+  status = clEnqueueWriteBuffer(clState->commandQueue, clState->MidstateBuf, CL_TRUE, 0, sizeof(mid_hash), mid_hash, 0, NULL, NULL);
+  uint32_t dbg[2] = {0};
+  status |= clEnqueueWriteBuffer(clState->commandQueue, clState->padbuffer8, CL_TRUE, 0, sizeof(dbg), &dbg, 0, NULL, NULL);
+  
+  cl_mem buf_ht[2] = {clState->CLbuffer0, clState->buffer1};
+  cl_mem rowCounters[2] = {clState->buffer2, clState->buffer3};
+  for (int round = 0; round < PARAM_K; round++) {
+    size_t global_ws = NR_ROWS / ROWS_PER_UINT;
+    size_t local_ws = 256;
+    unsigned int num = 0;
+    cl_kernel *kernel = &clState->extra_kernels[0];
+    // Now on every round!!!!
+    CL_SET_ARG(buf_ht[round % 2]);
+    CL_SET_ARG(rowCounters[round % 2]);
+    status |= clEnqueueNDRangeKernel(clState->commandQueue, *kernel, 1, NULL, &global_ws, &local_ws, 0, NULL, NULL);
+    
+    num = 0;
+    kernel = &clState->extra_kernels[1 + round];
+    if (!round) {
+      CL_SET_ARG(clState->MidstateBuf);
+      CL_SET_ARG(buf_ht[round % 2]);
+      CL_SET_ARG(rowCounters[round % 2]);
+      work_items = threads;
+    }
+    else {
+      CL_SET_ARG(buf_ht[(round - 1) % 2]);
+      CL_SET_ARG(buf_ht[round % 2]);
+      CL_SET_ARG(rowCounters[(round - 1) % 2]);
+      CL_SET_ARG(rowCounters[round % 2]);
+      work_items = NR_ROWS;
+    }
+    CL_SET_ARG(clState->padbuffer8);
+    if (round == PARAM_K - 1)
+      CL_SET_ARG(clState->outputBuffer);
+    status |= clEnqueueNDRangeKernel(clState->commandQueue, *kernel, 1, NULL, &work_items, &worksize, 0, NULL, NULL);
+  }
+  work_items = NR_ROWS;
+  status |= clEnqueueNDRangeKernel(clState->commandQueue, clState->kernel, 1, NULL, &work_items, &worksize, 0, NULL, NULL);
+ 
+  return status;
+}
 
 static algorithm_settings_t algos[] = {
   // kernels starting from this will have difficulty calculated by using litecoin algorithm
@@ -1218,11 +1290,14 @@ static algorithm_settings_t algos[] = {
   { "blake256r14", ALGO_BLAKE,     "", 1, 1, 1, 0, 0, 0xFF, 0xFFFFULL, 0x00000000UL, 0, 128, 0, blake256_regenhash, precalc_hash_blake256, queue_blake_kernel, gen_hash, NULL },
   { "vanilla",     ALGO_VANILLA,   "", 1, 1, 1, 0, 0, 0xFF, 0xFFFFULL, 0x000000ffUL, 0, 128, 0, blakecoin_regenhash, precalc_hash_blakecoin, queue_blake_kernel, gen_hash, NULL },
 
-  { "ethash",        ALGO_ETHASH,   "", (1ULL << 32), (1ULL << 32), 1, 0, 0, 0xFF, 0xFFFF000000000000ULL, 0, 0, 128, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, ethash_regenhash, NULL, queue_ethash_kernel, gen_hash, NULL },
-  { "ethash-genoil", ALGO_ETHASH,   "", (1ULL << 32), (1ULL << 32), 1, 0, 0, 0xFF, 0xFFFF000000000000ULL, 0, 0, 128, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, ethash_regenhash, NULL, queue_ethash_kernel, gen_hash, NULL },
-  
+  { "ethash",     ALGO_ETHASH,   "", (1ULL << 32), (1ULL << 32), 1, 0, 0, 0xFF, 0xFFFF000000000000ULL, 0x00000000UL, 0, 128, 0, ethash_regenhash, NULL, queue_ethash_kernel, gen_hash, append_ethash_compiler_options },
+  { "ethash-genoil",     ALGO_ETHASH,   "", (1ULL << 32), (1ULL << 32), 1, 0, 0, 0xFF, 0xFFFF000000000000ULL, 0x00000000UL, 0, 128, 0, ethash_regenhash, NULL, queue_ethash_kernel, gen_hash, append_ethash_compiler_options },
+
   { "cryptonight", ALGO_CRYPTONIGHT, "", (1ULL << 32), (1ULL << 32), (1ULL << 32), 0, 0, 0xFF, 0xFFFFULL, 0x0000ffffUL, 6, 0, 0, cryptonight_regenhash, NULL, queue_cryptonight_kernel, gen_hash, NULL },
-// Terminator (do not remove)
+  
+  { "equihash",     ALGO_EQUIHASH,   "", 1, (1ULL << 28), (1ULL << 28), 0, 0, 0x20000, 0xFFFF000000000000ULL, 0x00000000UL, 0, 128, 0, equihash_regenhash, NULL, queue_equihash_kernel, gen_hash, append_equihash_compiler_options },
+  
+  // Terminator (do not remove)
   { NULL, ALGO_UNK, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL }
 };
 
@@ -1298,6 +1373,7 @@ static const char *lookup_algorithm_alias(const char *lookup_alias, uint8_t *nfa
   ALGO_ALIAS("lyra2v2", "lyra2rev2");
   ALGO_ALIAS("blakecoin", "blake256r8");
   ALGO_ALIAS("blake", "blake256r14");
+  ALGO_ALIAS("zcash", "equihash");
 
 #undef ALGO_ALIAS
 #undef ALGO_ALIAS_NF
@@ -1315,14 +1391,16 @@ void set_algorithm(algorithm_t* algo, const char* newname_alias)
   const char *kernelfile = algo->kernelfile;
   uint8_t nfactor = 10;
 
-  if (!(newname = lookup_algorithm_alias(newname_alias, &nfactor)))
+  if (!(newname = lookup_algorithm_alias(newname_alias, &nfactor))) {
     newname = newname_alias;
+  }
 
   copy_algorithm_settings(algo, newname);
 
   // use old nfactor if it was previously set and is different than the one set by alias
-  if ((old_nfactor > 0) && (old_nfactor != nfactor))
+  if ((old_nfactor > 0) && (old_nfactor != nfactor)) {
     nfactor = old_nfactor;
+  }
 
   set_algorithm_nfactor(algo, nfactor);
 

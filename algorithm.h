@@ -38,11 +38,13 @@ typedef enum {
   ALGO_BLAKE,
   ALGO_VANILLA,
   ALGO_ETHASH,
-  ALGO_CRYPTONIGHT
+  ALGO_CRYPTONIGHT,
+  ALGO_EQUIHASH
 } algorithm_type_t;
 
 extern const char *algorithm_type_str[];
 
+extern void sha256(const unsigned char *message, unsigned int len, unsigned char *digest);
 extern void gen_hash(const unsigned char *data, unsigned int len, unsigned char *hash);
 
 struct __clState;

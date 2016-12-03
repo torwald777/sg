@@ -527,6 +527,35 @@ struct sgminer_pool_stats {
   uint64_t net_bytes_received;
 };
 
+typedef struct _gpu_sysfs_info {
+  char *HWMonPath;
+  uint32_t MinFanSpeed;
+  uint32_t MaxFanSpeed;
+  uint32_t OverHeatTemp;
+  uint32_t TargetTemp;
+  float TgtFanSpeed;
+  float LastFanSpeed;
+  float LastTemp;
+} gpu_sysfs_info;
+
+struct _eth_dag_t;
+typedef struct _eth_cache_t {
+  uint8_t seed_hash[32];
+  uint8_t *dag_cache;
+  struct _eth_dag_t **dags;
+  uint32_t current_epoch;
+  uint32_t nDevs;
+  bool disabled;
+} eth_cache_t;
+
+typedef struct _eth_dag_t {
+  cglock_t lock;
+  cl_mem dag_buffer;
+  struct pool *pool;
+  uint32_t current_epoch;
+  uint32_t max_epoch;
+} eth_dag_t;
+
 struct cgpu_info {
   int sgminer_id;
   struct device_drv *drv;
@@ -576,10 +605,11 @@ struct cgpu_info {
   float temp;
   int cutofftemp;
 
-#ifdef HAVE_ADL
+  bool has_sysfs_hwcontrols;
   bool has_adl;
   struct gpu_adl adl;
-
+  gpu_sysfs_info sysfs_info;
+  
   int gpu_engine;
   int min_engine;
   int gpu_fan;
@@ -588,7 +618,7 @@ struct cgpu_info {
   int gpu_memdiff;
   int gpu_powertune;
   float gpu_vddc;
-#endif
+  
   double diff1;
   double diff_accepted;
   double diff_rejected;
@@ -612,6 +642,7 @@ struct cgpu_info {
   int dev_throttle_count;
 
   struct sgminer_stats sgminer_stats;
+  eth_dag_t eth_dag;
 
   bool shutdown;
 
@@ -838,6 +869,7 @@ extern void api_initlock(void *lock, enum cglock_typ typ, const char *file, cons
 #define cglock_init(_lock) _cglock_init(_lock, __FILE__, __func__, __LINE__)
 #define cg_rlock(_lock) _cg_rlock(_lock, __FILE__, __func__, __LINE__)
 #define cg_ilock(_lock) _cg_ilock(_lock, __FILE__, __func__, __LINE__)
+#define cg_iunlock(_lock) _cg_iunlock(_lock, __FILE__, __func__, __LINE__)
 #define cg_ulock(_lock) _cg_ulock(_lock, __FILE__, __func__, __LINE__)
 #define cg_wlock(_lock) _cg_wlock(_lock, __FILE__, __func__, __LINE__)
 #define cg_dwlock(_lock) _cg_dwlock(_lock, __FILE__, __func__, __LINE__)
@@ -982,6 +1014,12 @@ static inline void _cg_ilock(cglock_t *lock, const char *file, const char *func,
   _mutex_lock(&lock->mutex, file, func, line);
 }
 
+/* Unlock intermediate lock - behaves like a mutex. */
+static inline void _cg_iunlock(cglock_t *lock, const char *file, const char *func, const int line)
+{
+  _mutex_unlock_noyield(&lock->mutex, file, func, line);
+}
+
 /* Upgrade intermediate variant to a write lock */
 static inline void _cg_ulock(cglock_t *lock, const char *file, const char *func, const int line)
 {
@@ -1086,6 +1124,21 @@ extern int swork_id;
 extern int opt_tcp_keepalive;
 extern bool opt_incognito;
 
+extern float (*gpu_temp)(int);
+extern int (*gpu_engineclock)(int);
+extern int (*gpu_memclock)(int);
+extern float (*gpu_vddc)(int);
+extern int (*gpu_activity)(int);
+extern int (*gpu_fanspeed)(int);
+extern float (*gpu_fanpercent)(int);
+extern int (*set_powertune)(int, int);
+extern int (*set_fanspeed)(int, float);
+extern int (*set_vddc)(int, float);
+extern int (*set_engineclock)(int, int);
+extern int (*set_memoryclock)(int, int);
+extern bool (*gpu_stats)(int, float *, int *, int *, float *, int *, int *, int *, int *);
+extern void (*gpu_autotune) (int, enum dev_enable *);
+
 // Xn Algorithm options
 extern int opt_keccak_unroll;
 extern bool opt_blake_compact;
@@ -1143,14 +1196,6 @@ extern void set_target_neoscrypt(unsigned char *target, double diff, const int t
 extern void kill_work(void);
 
 extern void reinit_device(struct cgpu_info *cgpu);
-
-#ifdef HAVE_ADL
-extern bool gpu_stats(int gpu, float *temp, int *engineclock, int *memclock, float *vddc, int *activity, int *fanspeed, int *fanpercent, int *powertune);
-extern int set_fanspeed(int gpu, int iFanSpeed);
-extern int set_vddc(int gpu, float fVddc);
-extern int set_engineclock(int gpu, int iEngineClock);
-extern int set_memoryclock(int gpu, int iMemoryClock);
-#endif
 
 extern void api(int thr_id);
 
@@ -1272,7 +1317,7 @@ struct stratum_work {
   char *nbit;
   char *ntime;
   bool clean;
-  
+
   size_t cb_len;
   size_t header_len;
   int merkles;
@@ -1298,11 +1343,11 @@ struct pool {
   int quota_gcd;
   int quota_used;
   int works;
-  uint8_t SeedHash[32];
-  uint32_t EpochNumber;
+  eth_cache_t eth_cache;
   uint8_t Target[32];
   uint8_t EthWork[32];
-
+  uint8_t NetDiff[32];
+  
   //XMR stuff
   char XMRAuthID[64];
   uint32_t XMRTarget;
@@ -1430,6 +1475,9 @@ struct pool {
   size_t gbt_txns;
   size_t coinbase_len;
 
+  /* equihash GBT */
+  unsigned char reserved[32];
+
   /* Shared by both stratum & GBT */
   unsigned char *coinbase;
   size_t nonce2_offset;
@@ -1451,16 +1499,15 @@ struct work {
   unsigned char data[168];
   unsigned char midstate[32];
   unsigned char target[32];
-  unsigned char seedhash[32];
   unsigned char hash[32];
   unsigned char mixhash[32];
-    
+
   unsigned char device_target[32];
   double    device_diff;
   double    share_diff;
   double	network_diff;
-  
-  uint32_t EpochNumber;
+
+  uint32_t eth_epoch;
   uint64_t Nonce;
   
   /* cryptonight stuff */
@@ -1469,11 +1516,13 @@ struct work {
     
   uint32_t XMRNonce;
   
+  unsigned char equihash_data[1487];
+
   int   rolls;
   int   drv_rolllimit; /* How much the driver can roll ntime */
 
   dev_blk_ctx blk;
-  
+
   struct thr_info *thr;
   int   thr_id;
   struct pool *pool;
