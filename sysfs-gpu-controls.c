@@ -25,7 +25,7 @@ int sysfs_set_vddc(int gpu, float fVddc) { return 1; }
 static void sysfs_init(gpu_sysfs_info *info, int gpu_idx)
 {
   memset(info, 0, sizeof(gpu_sysfs_info));
-  info->fd_fan = info->fd_temp = info->fd_pptable = -1;
+  info->fd_pptable = info->fd_fan = info->fd_temp = info->fd_pwm = info->fd_mclk = info->fd_sclk -1;
 }
 
 #else
@@ -41,17 +41,17 @@ static void sysfs_init(gpu_sysfs_info *info, int gpu_idx)
   char path[256];
   struct dirent *inner_hwmon;
   
-  info->fd_pptable = info->fd_fan = info->fd_temp = info->fd_pwm = -1;
+  info->fd_pptable = info->fd_fan = info->fd_temp = info->fd_pwm = info->fd_mclk = info->fd_sclk -1;
 
-  snprintf(path, sizeof(path), "/sys/bus/pci/devices/0000:%.2x:%.2x.%.1x/", 
-    info->pcie_index[0], info->pcie_index[1], info->pcie_index[2]);
+  snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/hwmon", gpu_idx);
   size_t len = strlen(path);
 
   snprintf(path + len, sizeof(path) - len, "hwmon");
   DIR *hwmon = opendir(path); 
   if (hwmon == NULL) {
     applog(LOG_DEBUG, "Failed to open hwmon directory %s for GPU%d", path, gpu_idx);
-    snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/hwmon", gpu_idx);
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/0000:%.2x:%.2x.%.1x/", 
+      info->pcie_index[0], info->pcie_index[1], info->pcie_index[2]);
     len = strlen(path) - 5;
     hwmon = opendir(path);
     if (hwmon == NULL) {
