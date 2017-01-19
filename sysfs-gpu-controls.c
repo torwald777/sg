@@ -25,7 +25,7 @@ int sysfs_set_vddc(int gpu, float fVddc) { return 1; }
 static void sysfs_init(gpu_sysfs_info *info, int gpu_idx)
 {
   memset(info, 0, sizeof(gpu_sysfs_info));
-  info->fd_pptable = info->fd_fan = info->fd_temp = info->fd_pwm = info->fd_mclk = info->fd_sclk -1;
+  info->fd_pptable = info->fd_fan = info->fd_temp = info->fd_pwm = info->fd_mclk = info->fd_sclk = -1;
 }
 
 #else
@@ -41,7 +41,7 @@ static void sysfs_init(gpu_sysfs_info *info, int gpu_idx)
   char path[256];
   struct dirent *inner_hwmon;
   
-  info->fd_pptable = info->fd_fan = info->fd_temp = info->fd_pwm = info->fd_mclk = info->fd_sclk -1;
+  info->fd_pptable = info->fd_fan = info->fd_temp = info->fd_pwm = info->fd_mclk = info->fd_sclk = -1;
 
   snprintf(path, sizeof(path), "/sys/class/drm/card%d/device/hwmon", gpu_idx);
   size_t len = strlen(path);
